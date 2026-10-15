@@ -56,7 +56,7 @@ flowchart TD
 | **Embedding Engine** | Cohere API (`embed-english-v3.0`, 1024-dim) |
 | **Generation Engine** | Cohere Chat (`command-r-08-2024`) |
 | **Document Parsers** | PyPDF, `pdfplumber` (tables), `python-docx` |
-| **Testing** | Pytest, HTTPX TestClient (58 unit & integration tests) |
+| **Testing** | Pytest, HTTPX TestClient (65 unit & integration tests) |
 
 ---
 
@@ -79,7 +79,7 @@ KNOWLEDGE AI PROJECT/
 │   │   │   ├── rag.py       # Grounded RAG with language-aware system prompts
 │   │   │   └── vector_store.py # ChromaDB client & indexing operations
 │   │   └── main.py          # FastAPI application lifespan & initial admin seeder
-│   ├── tests/               # Pytest test suite (58 unit & integration tests)
+│   ├── tests/               # Pytest test suite (65 unit & integration tests)
 │   │   ├── conftest.py      # Global fixtures & dependency overrides
 │   │   ├── test_auth.py     # Auth, RBAC, password strength & reset tests
 │   │   ├── test_ingestion.py# File upload, deduplication & corrupted file tests
@@ -243,27 +243,31 @@ During server startup, the backend checks for an initial administrator. If none 
 |---|---|---|:---:|
 | `GET` | `/api/health` | Health check returning API, SQLite, and ChromaDB status | Public |
 | `POST` | `/api/documents/upload` | Multipart file upload with SHA-256 deduplication & chunking | `admin`, `editor` |
-| `GET` | `/api/documents` | Lists all documents with status, chunk counts, and errors | All authenticated users |
-| `GET` | `/api/documents/{id}` | Retrieves metadata of a single document | All authenticated users |
-| `DELETE` | `/api/documents/{id}` | Deletes record, disk file, and purges ChromaDB vectors | `admin`, `editor` |
+| `GET` | `/api/documents` | Lists accessible documents with status, chunk counts, and errors | All authenticated users |
+| `GET` | `/api/documents/{id}` | Retrieves metadata of a single document (confidentiality guarded) | All authenticated users |
+| `DELETE` | `/api/documents/{id}` | Deletes record, disk file, and purges ChromaDB vectors | `admin`, uploader |
 | `POST` | `/api/documents/{id}/index` | Re-indexes document vectors into ChromaDB | `admin`, `editor` |
 | `GET` | `/api/documents/{id}/file` | Secure file stream (Bearer header or `?token=` parameter) | All authenticated users |
-| `POST` | `/api/rag/ask` | Grounded multilingual RAG Q&A with exact citations | All authenticated users |
+| `POST` | `/api/rag/ask` | Grounded multilingual RAG Q&A with exact citations & session isolation | All authenticated users |
 | `POST` | `/api/rag/search` | Direct semantic vector search across document chunks | All authenticated users |
+| `GET` | `/api/rag/sessions` | Lists user's isolated chat sessions | All authenticated users |
+| `GET` | `/api/rag/sessions/{id}` | Retrieves full conversation transcript (ownership enforced with 403) | All authenticated users |
+| `DELETE` | `/api/rag/sessions/{id}` | Deletes chat session (ownership enforced with 403) | All authenticated users |
+| `GET` | `/api/dashboard/stats` | Real-time system statistics and user-isolated conversation counts | All authenticated users |
 
 ---
 
 ## Running Verification Tests
 
-### Backend Test Suite (58 Tests)
-Execute all 58 automated unit and integration tests:
+### Backend Test Suite (65 Tests)
+Execute all 65 automated unit and integration tests:
 ```powershell
 cd "c:\Users\windows\Desktop\KNOWLEDGE AI PROJECT\backend"
 .\venv\Scripts\pytest -v
 ```
 
 **Test Coverage Summary**:
-- **12 Auth & RBAC Tests**: `bcrypt` hashing, password strength validation, user registration, duplicate rejection, login, token revocation, forgot/reset flow, 401 unauthorized protection, 403 viewer role restrictions, multilingual RAG dispatch.
+- **19 Auth, RBAC & Isolation Tests**: `bcrypt` hashing, password strength validation, user registration, duplicate rejection, login, token revocation, expired token rejection, forgot/reset flow, 401 unauthorized protection, 403 viewer role restrictions, multilingual RAG dispatch, conversation session isolation, user-isolated session listing and deletion, restricted document cross-user access prevention, document deletion ownership check, dashboard statistics isolation, and multi-turn conversational follow-up memory.
 - **18 Ingestion Tests**: PDF/DOCX parsing, tabular extraction, sliding window chunking, SHA-256 deduplication (`409`), path traversal protection, corrupted file handling, and consistent delete cascading.
 - **25 Vector & RAG Tests**: ChromaDB upsert/query/purge, Cohere embeddings, grounded Q&A, citation deduplication, source isolation, low-similarity threshold filtering, and Rule 7 anti-prompt-injection.
 - **3 System Health Tests**: Root endpoint, database table creation, and service health check.

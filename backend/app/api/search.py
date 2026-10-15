@@ -164,13 +164,37 @@ def ask_document_assistant(
         except Exception as e:
             logger.error(f"Retrieval error during RAG: {e}")
 
-    # 2. Grounded Answer Generation in requested language
+    # 2. Check session ownership & fetch recent history for follow-up questions
+    session_id = request.session_id or str(uuid.uuid4())
+    session_record = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+    if not session_record:
+        session_record = ChatSession(
+            id=session_id,
+            user_id=current_user.id,
+            title=clean_question[:50] + ("..." if len(clean_question) > 50 else "")
+        )
+        db.add(session_record)
+        db.commit()
+    elif session_record.user_id is not None and session_record.user_id != current_user.id and current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: This conversation session belongs to another user."
+        )
+
+    # Fetch recent turns for conversational follow-up questions
+    recent_messages = db.query(ChatMessage).filter(
+        ChatMessage.session_id == session_id
+    ).order_by(ChatMessage.id.desc()).limit(6).all()
+    chat_history = [{"role": m.role, "content": m.content} for m in reversed(recent_messages)]
+
+    # 3. Grounded Answer Generation in requested language
     target_lang = (request.language or "en").lower().strip()
     try:
         rag_output = rag_service.generate_grounded_answer(
             query=clean_question,
             context_chunks=context_chunks,
-            language=target_lang
+            language=target_lang,
+            chat_history=chat_history
         )
     except CohereServiceError as cse:
         logger.error(f"Cohere RAG generation error [{cse.error_type}]: {cse.message}")
@@ -186,25 +210,13 @@ def ask_document_assistant(
             detail=f"Failed to generate answer: {str(e)}"
         )
 
-    # 3. Store conversation in SQLite
-    session_id = request.session_id or str(uuid.uuid4())
-    session_record = db.query(ChatSession).filter(ChatSession.id == session_id).first()
-    if not session_record:
-        session_record = ChatSession(
-            id=session_id,
-            title=clean_question[:50] + ("..." if len(clean_question) > 50 else "")
-        )
-        db.add(session_record)
-        db.commit()
-
-    # Save User message
+    # 4. Save User & Assistant messages to session
     user_msg = ChatMessage(
         session_id=session_id,
         role="user",
         content=clean_question,
         sources=None
     )
-    # Save Assistant message with cited sources
     assistant_msg = ChatMessage(
         session_id=session_id,
         role="assistant",
@@ -221,4 +233,145 @@ def ask_document_assistant(
         "answer": rag_output.get("answer", ""),
         "sources": rag_output.get("sources", []),
         "chunks_used": rag_output.get("chunks_used", len(context_chunks))
+    }
+
+
+# ==========================================
+# User-Specific Chat History & Isolation Endpoints
+# ==========================================
+
+@router.get("/rag/sessions")
+def list_user_chat_sessions(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Returns chat sessions belonging strictly to the authenticated user.
+    Enforces conversation isolation across users.
+    """
+    sessions = db.query(ChatSession).filter(
+        ChatSession.user_id == current_user.id
+    ).order_by(ChatSession.created_at.desc()).all()
+
+    return [
+        {
+            "id": s.id,
+            "title": s.title,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+            "message_count": len(s.messages)
+        }
+        for s in sessions
+    ]
+
+
+@router.get("/rag/sessions/{session_id}")
+def get_user_chat_session(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Retrieves full message history for a specific chat session.
+    Enforces conversation isolation: raises 403 Forbidden if accessed by another non-admin user.
+    """
+    session_record = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+    if not session_record:
+        raise HTTPException(status_code=404, detail="Chat session not found.")
+
+    if session_record.user_id is not None and session_record.user_id != current_user.id and current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You do not have permission to view another user's conversation."
+        )
+
+    messages = db.query(ChatMessage).filter(
+        ChatMessage.session_id == session_id
+    ).order_by(ChatMessage.id.asc()).all()
+
+    return {
+        "id": session_record.id,
+        "title": session_record.title,
+        "user_id": session_record.user_id,
+        "created_at": session_record.created_at.isoformat() if session_record.created_at else None,
+        "messages": [
+            {
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "sources": json.loads(m.sources) if m.sources else [],
+                "created_at": m.created_at.isoformat() if m.created_at else None
+            }
+            for m in messages
+        ]
+    }
+
+
+@router.delete("/rag/sessions/{session_id}")
+def delete_user_chat_session(
+    session_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Deletes a chat session and its associated messages.
+    Enforces conversation isolation: raises 403 Forbidden if attempted by another non-admin user.
+    """
+    session_record = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+    if not session_record:
+        raise HTTPException(status_code=404, detail="Chat session not found.")
+
+    if session_record.user_id is not None and session_record.user_id != current_user.id and current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You cannot delete another user's conversation."
+        )
+
+    db.delete(session_record)
+    db.commit()
+    return {"message": "Chat session and conversation history deleted successfully."}
+
+
+# ==========================================
+# Dashboard Statistics Endpoint
+# ==========================================
+
+@router.get("/dashboard/stats")
+def get_dashboard_statistics(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Provides real-time system and user-specific dashboard metrics.
+    Enforces user isolation for conversation counts.
+    """
+    from app.models.schema import Document, DocumentChunk
+
+    total_docs = db.query(Document).count()
+    indexed_docs = db.query(Document).filter(Document.status == "indexed").count()
+    failed_docs = db.query(Document).filter(Document.status == "failed").count()
+    total_chunks = db.query(DocumentChunk).count()
+
+    # User-specific metrics
+    user_conversations = db.query(ChatSession).filter(ChatSession.user_id == current_user.id).count()
+    user_messages = db.query(ChatMessage).join(ChatSession).filter(ChatSession.user_id == current_user.id).count()
+
+    vector_count = 0
+    try:
+        vector_count = vector_store.count()
+    except Exception:
+        pass
+
+    return {
+        "total_documents": total_docs,
+        "indexed_documents": indexed_docs,
+        "failed_documents": failed_docs,
+        "total_chunks": total_chunks,
+        "total_vectors": vector_count,
+        "user_conversations": user_conversations,
+        "user_messages": user_messages,
+        "user_role": current_user.role,
+        "user_email": current_user.email,
+        "user_name": current_user.full_name,
+        "cohere_configured": rag_service.is_configured,
+        "status": "operational"
     }

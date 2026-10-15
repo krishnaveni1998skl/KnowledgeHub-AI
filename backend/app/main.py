@@ -27,6 +27,16 @@ async def lifespan(app: FastAPI):
                 conn.execute(text("ALTER TABLE documents ADD COLUMN error_message TEXT"))
             if "file_hash" not in existing_cols:
                 conn.execute(text("ALTER TABLE documents ADD COLUMN file_hash VARCHAR(64)"))
+            if "uploaded_by_id" not in existing_cols:
+                conn.execute(text("ALTER TABLE documents ADD COLUMN uploaded_by_id INTEGER"))
+            if "is_restricted" not in existing_cols:
+                conn.execute(text("ALTER TABLE documents ADD COLUMN is_restricted BOOLEAN DEFAULT 0"))
+            conn.commit()
+
+        if "chat_sessions" in inspector.get_table_names():
+            existing_chat_cols = {col["name"] for col in inspector.get_columns("chat_sessions")}
+            if "user_id" not in existing_chat_cols:
+                conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN user_id INTEGER"))
             conn.commit()
 
             # Backfill file_hash for existing files on disk if null

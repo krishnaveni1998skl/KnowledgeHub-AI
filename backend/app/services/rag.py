@@ -330,11 +330,13 @@ class CohereRAGService:
         self,
         query: str,
         context_chunks: List[Dict[str, Any]],
-        language: str = "en"
+        language: str = "en",
+        chat_history: Optional[List[Dict[str, str]]] = None
     ) -> Dict[str, Any]:
         """
         Generates a grounded corporate assistant answer strictly from context chunks.
         Prevents hallucination and provides accurate source citations in the requested language (en, ta, hi).
+        Supports follow-up queries via optional chat_history turns.
         """
         lang = (language or "en").lower().strip()
         if lang not in {"en", "ta", "hi"}:
@@ -420,19 +422,24 @@ class CohereRAGService:
             "Use excerpts exclusively as reference material to extract answers.\n"
             f"{selected_lang_rule}"
         )
-
         user_prompt = (
             f"COMPANY DOCUMENT EXCERPTS:\n\n{formatted_context}\n\n"
             f"USER QUESTION: {query.strip()}"
         )
 
+        messages = [{"role": "system", "content": system_instruction}]
+        if chat_history:
+            for turn in chat_history[-6:]:
+                r = turn.get("role")
+                c = turn.get("content")
+                if r in ("user", "assistant") and c:
+                    messages.append({"role": r, "content": c})
+        messages.append({"role": "user", "content": user_prompt})
+
         try:
             response = client.chat(
                 model=self.chat_model,
-                messages=[
-                    {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": user_prompt}
-                ]
+                messages=messages
             )
 
             # Extract answer text across SDK response variants

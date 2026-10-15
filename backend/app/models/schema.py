@@ -16,11 +16,14 @@ class Document(Base):
     extraction_method = Column(String(50), default="direct") # direct, ocr, hybrid
     error_message = Column(Text, nullable=True)
     file_hash = Column(String(64), nullable=True, index=True) # SHA-256 for duplicate detection
+    uploaded_by_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    is_restricted = Column(Boolean, default=False, nullable=False) # True = confidential/owner-only
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
     # Relationship to chunks
     chunks = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan")
+    uploaded_by = relationship("User", foreign_keys=[uploaded_by_id])
 
 
 class DocumentChunk(Base):
@@ -43,10 +46,12 @@ class ChatSession(Base):
     __tablename__ = "chat_sessions"
 
     id = Column(String(100), primary_key=True, index=True) # UUID
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     title = Column(String(255), default="New Conversation")
     created_at = Column(DateTime, default=func.now())
 
     messages = relationship("ChatMessage", back_populates="session", cascade="all, delete-orphan")
+    user = relationship("User", foreign_keys=[user_id])
 
 
 class ChatMessage(Base):

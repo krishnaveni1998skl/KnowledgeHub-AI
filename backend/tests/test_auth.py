@@ -14,7 +14,7 @@ from unittest.mock import patch, MagicMock
 
 from app.main import app
 from app.database import SessionLocal
-from app.models.schema import User, UserSession, PasswordResetToken
+from app.models.schema import User, UserSession, PasswordResetToken, Document
 from app.services.auth import hash_password, verify_password, validate_password_strength
 
 # Helper to generate unique emails in tests
@@ -384,3 +384,324 @@ def test_rag_multilingual_tamil_and_hindi_dispatch():
         chat_args_hi = mock_client.chat.call_args[1]
         system_content_hi = chat_args_hi["messages"][0]["content"]
         assert "Hindi" in system_content_hi or "हिन्दी" in system_content_hi
+
+
+# ==========================================
+# 7. Session Expiry & Security Edge Cases
+# ==========================================
+
+def test_expired_session_token_rejected_with_401():
+    """Verify that an expired bearer session token is rejected with HTTP 401."""
+    from datetime import datetime, timedelta, timezone
+    from app.services.auth import create_user_session, hash_token
+
+    email = get_random_email()
+    with TestClient(app) as client:
+        # Register user
+        reg_resp = client.post(
+            "/api/auth/register",
+            json={"full_name": "Expiry User", "email": email, "password": "Password123!"}
+        )
+        assert reg_resp.status_code == 201
+        token = reg_resp.json()["token"]
+
+        # Token initially works
+        assert client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"}).status_code == 200
+
+        # Artificially expire the token in SQLite
+        db = SessionLocal()
+        try:
+            t_hash = hash_token(token)
+            session_rec = db.query(UserSession).filter(UserSession.token_hash == t_hash).first()
+            assert session_rec is not None
+            session_rec.expires_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
+            db.commit()
+        finally:
+            db.close()
+
+        # Expired token is rejected with 401
+        expired_resp = client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert expired_resp.status_code == 401
+        assert "expired" in expired_resp.json()["detail"].lower()
+
+
+# ==========================================
+# 8. User Conversation Isolation & Chat History Tests
+# ==========================================
+
+def test_conversation_session_isolation_across_users():
+    """Verify that User B cannot query or inject messages into User A's chat session."""
+    user_a_email = get_random_email()
+    user_b_email = get_random_email()
+
+    mock_rag_response = {
+        "answer": "This is a confidential answer. [sample.pdf (Page 1)]",
+        "sources": [{"document_id": 1, "filename": "sample.pdf", "page_number": 1}],
+        "chunks_used": 1
+    }
+
+    with patch("app.api.search.rag_service.generate_grounded_answer", return_value=mock_rag_response), \
+         patch("app.api.search.rag_service.embed_query", return_value=[0.1]*5), \
+         patch("app.api.search.vector_store.count", return_value=1), \
+         patch("app.api.search.vector_store.query_similar", return_value=[]):
+
+        with TestClient(app) as client:
+            # Register User A and User B
+            token_a = client.post("/api/auth/register", json={"full_name": "User A", "email": user_a_email, "password": "Password123!"}).json()["token"]
+            token_b = client.post("/api/auth/register", json={"full_name": "User B", "email": user_b_email, "password": "Password123!"}).json()["token"]
+
+            # User A initiates a conversation
+            ask_resp_a = client.post(
+                "/api/rag/ask",
+                json={"question": "What is our company secret policy?", "top_k": 5},
+                headers={"Authorization": f"Bearer {token_a}"}
+            )
+            assert ask_resp_a.status_code == 200
+            session_id = ask_resp_a.json()["session_id"]
+
+            # User A can inspect the session
+            sess_resp_a = client.get(
+                f"/api/rag/sessions/{session_id}",
+                headers={"Authorization": f"Bearer {token_a}"}
+            )
+            assert sess_resp_a.status_code == 200
+            assert len(sess_resp_a.json()["messages"]) == 2
+
+            # User B attempts to access User A's session -> 403 Forbidden
+            sess_resp_b = client.get(
+                f"/api/rag/sessions/{session_id}",
+                headers={"Authorization": f"Bearer {token_b}"}
+            )
+            assert sess_resp_b.status_code == 403
+            assert "access denied" in sess_resp_b.json()["detail"].lower()
+
+            # User B attempts to append a message to User A's session -> 403 Forbidden
+            hijack_resp = client.post(
+                "/api/rag/ask",
+                json={"question": "Tell me User A's secrets!", "session_id": session_id},
+                headers={"Authorization": f"Bearer {token_b}"}
+            )
+            assert hijack_resp.status_code == 403
+            assert "another user" in hijack_resp.json()["detail"].lower()
+
+
+def test_user_specific_chat_sessions_listing_and_deletion():
+    """Verify that /api/rag/sessions returns only the caller's conversations and deletion enforces ownership."""
+    user_a_email = get_random_email()
+    user_b_email = get_random_email()
+
+    mock_rag_response = {
+        "answer": "Answer text",
+        "sources": [],
+        "chunks_used": 0
+    }
+
+    with patch("app.api.search.rag_service.generate_grounded_answer", return_value=mock_rag_response), \
+         patch("app.api.search.rag_service.embed_query", return_value=[0.1]*5), \
+         patch("app.api.search.vector_store.count", return_value=0):
+
+        with TestClient(app) as client:
+            token_a = client.post("/api/auth/register", json={"full_name": "User A", "email": user_a_email, "password": "Password123!"}).json()["token"]
+            token_b = client.post("/api/auth/register", json={"full_name": "User B", "email": user_b_email, "password": "Password123!"}).json()["token"]
+
+            # User A asks 2 questions in distinct sessions
+            resp_a1 = client.post("/api/rag/ask", json={"question": "Question A1"}, headers={"Authorization": f"Bearer {token_a}"}).json()
+            resp_a2 = client.post("/api/rag/ask", json={"question": "Question A2"}, headers={"Authorization": f"Bearer {token_a}"}).json()
+            session_a1 = resp_a1["session_id"]
+            session_a2 = resp_a2["session_id"]
+
+            # User B asks 1 question
+            resp_b = client.post("/api/rag/ask", json={"question": "Question B1"}, headers={"Authorization": f"Bearer {token_b}"}).json()
+            session_b = resp_b["session_id"]
+
+            # Listing for User A returns exactly 2 sessions
+            list_a = client.get("/api/rag/sessions", headers={"Authorization": f"Bearer {token_a}"}).json()
+            assert len(list_a) == 2
+            ids_a = {s["id"] for s in list_a}
+            assert session_a1 in ids_a
+            assert session_a2 in ids_a
+            assert session_b not in ids_a
+
+            # Listing for User B returns exactly 1 session
+            list_b = client.get("/api/rag/sessions", headers={"Authorization": f"Bearer {token_b}"}).json()
+            assert len(list_b) == 1
+            assert list_b[0]["id"] == session_b
+
+            # User B cannot delete User A's session -> 403 Forbidden
+            del_fail = client.delete(f"/api/rag/sessions/{session_a1}", headers={"Authorization": f"Bearer {token_b}"})
+            assert del_fail.status_code == 403
+
+            # User A can delete their own session -> 200 OK
+            del_ok = client.delete(f"/api/rag/sessions/{session_a1}", headers={"Authorization": f"Bearer {token_a}"})
+            assert del_ok.status_code == 200
+
+            # Verify it is deleted
+            list_a_after = client.get("/api/rag/sessions", headers={"Authorization": f"Bearer {token_a}"}).json()
+            assert len(list_a_after) == 1
+            assert list_a_after[0]["id"] == session_a2
+
+
+# ==========================================
+# 9. Cross-User Document Access & Permissions Tests
+# ==========================================
+
+def test_restricted_document_cross_user_access_prevention():
+    """Verify that restricted documents cannot be previewed, chunk-inspected, or downloaded by other non-admin users."""
+    user_a_email = get_random_email()
+    user_b_email = get_random_email()
+
+    with TestClient(app) as client:
+        token_a = client.post("/api/auth/register", json={"full_name": "Editor A", "email": user_a_email, "password": "Password123!"}).json()["token"]
+        token_b = client.post("/api/auth/register", json={"full_name": "Viewer B", "email": user_b_email, "password": "Password123!"}).json()["token"]
+
+        # Elevate User A to editor
+        db = SessionLocal()
+        try:
+            user_a = db.query(User).filter(User.email == user_a_email).first()
+            user_a.role = "editor"
+            db.commit()
+
+            # Create a restricted document owned by User A
+            import tempfile
+            temp_file = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            temp_file.write(b"%PDF-1.4 confidential content")
+            temp_file.close()
+
+            doc = Document(
+                filename="confidential_merger.pdf",
+                file_type="pdf",
+                file_size=100,
+                file_path=temp_file.name,
+                file_hash="mock_hash_confidential",
+                status="indexed",
+                uploaded_by_id=user_a.id,
+                is_restricted=True,
+                page_count=1,
+                chunk_count=1
+            )
+            db.add(doc)
+            db.commit()
+            db.refresh(doc)
+            doc_id = doc.id
+        finally:
+            db.close()
+
+        # User B (viewer) attempts to get metadata -> 403 Forbidden
+        meta_resp_b = client.get(f"/api/documents/{doc_id}", headers={"Authorization": f"Bearer {token_b}"})
+        assert meta_resp_b.status_code == 403
+        assert "access denied" in meta_resp_b.json()["detail"].lower()
+
+        # User B attempts to view chunks -> 403 Forbidden
+        chunks_resp_b = client.get(f"/api/documents/{doc_id}/chunks", headers={"Authorization": f"Bearer {token_b}"})
+        assert chunks_resp_b.status_code == 403
+
+        # User B attempts to download file -> 403 Forbidden
+        file_resp_b = client.get(f"/api/documents/{doc_id}/file", headers={"Authorization": f"Bearer {token_b}"})
+        assert file_resp_b.status_code == 403
+
+        # User A (owner) CAN access metadata and chunks -> 200 OK
+        meta_resp_a = client.get(f"/api/documents/{doc_id}", headers={"Authorization": f"Bearer {token_a}"})
+        assert meta_resp_a.status_code == 200
+
+
+def test_document_deletion_ownership_check():
+    """Verify that an editor cannot delete another editor's upload, but an administrator can."""
+    editor_a_email = get_random_email()
+    editor_b_email = get_random_email()
+
+    with TestClient(app) as client:
+        token_a = client.post("/api/auth/register", json={"full_name": "Editor A", "email": editor_a_email, "password": "Password123!"}).json()["token"]
+        token_b = client.post("/api/auth/register", json={"full_name": "Editor B", "email": editor_b_email, "password": "Password123!"}).json()["token"]
+
+        db = SessionLocal()
+        try:
+            user_a = db.query(User).filter(User.email == editor_a_email).first()
+            user_b = db.query(User).filter(User.email == editor_b_email).first()
+            user_a.role = "editor"
+            user_b.role = "editor"
+            db.commit()
+
+            doc = Document(
+                filename="editor_a_doc.pdf",
+                file_type="pdf",
+                file_size=500,
+                file_path="",
+                file_hash="hash_a_123",
+                status="indexed",
+                uploaded_by_id=user_a.id,
+                is_restricted=False
+            )
+            db.add(doc)
+            db.commit()
+            db.refresh(doc)
+            doc_id = doc.id
+        finally:
+            db.close()
+
+        # Editor B attempts to delete Editor A's document -> 403 Forbidden
+        del_fail = client.delete(f"/api/documents/{doc_id}", headers={"Authorization": f"Bearer {token_b}"})
+        assert del_fail.status_code == 403
+        assert "uploaded" in del_fail.json()["detail"].lower()
+
+        # Editor A can delete their own document -> 200 OK
+        del_ok = client.delete(f"/api/documents/{doc_id}", headers={"Authorization": f"Bearer {token_a}"})
+        assert del_ok.status_code == 200
+
+
+# ==========================================
+# 10. Dashboard Stats & Follow-Up Questions Tests
+# ==========================================
+
+def test_dashboard_stats_endpoint():
+    """Verify that /api/dashboard/stats returns real-time document and user-isolated conversation counts."""
+    email = get_random_email()
+    with TestClient(app) as client:
+        token = client.post("/api/auth/register", json={"full_name": "Stats User", "email": email, "password": "Password123!"}).json()["token"]
+
+        resp = client.get("/api/dashboard/stats", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "total_documents" in data
+        assert "indexed_documents" in data
+        assert "failed_documents" in data
+        assert "total_chunks" in data
+        assert "total_vectors" in data
+        assert "user_conversations" in data
+        assert data["user_role"] == "viewer"
+        assert data["user_email"] == email
+
+
+def test_rag_follow_up_questions_receive_chat_history():
+    """Verify that when a session_id is provided, previous turns are passed to generate_grounded_answer."""
+    user_email = get_random_email()
+    captured_chat_history = []
+
+    def mock_generate_grounded_answer(query, context_chunks, language="en", chat_history=None):
+        nonlocal captured_chat_history
+        captured_chat_history = chat_history or []
+        return {
+            "answer": f"Grounded response for: {query}",
+            "sources": [],
+            "chunks_used": 0
+        }
+
+    with patch("app.api.search.rag_service.generate_grounded_answer", side_effect=mock_generate_grounded_answer), \
+         patch("app.api.search.rag_service.embed_query", return_value=[0.1]*5), \
+         patch("app.api.search.vector_store.count", return_value=0):
+
+        with TestClient(app) as client:
+            token = client.post("/api/auth/register", json={"full_name": "Chat User", "email": user_email, "password": "Password123!"}).json()["token"]
+            auth_header = {"Authorization": f"Bearer {token}"}
+
+            # Turn 1: First question
+            resp1 = client.post("/api/rag/ask", json={"question": "What is Rahul Kumar's department?"}, headers=auth_header).json()
+            session_id = resp1["session_id"]
+            assert len(captured_chat_history) == 0  # No prior history on Turn 1
+
+            # Turn 2: Follow-up question in the same session
+            client.post("/api/rag/ask", json={"question": "What is his status?", "session_id": session_id}, headers=auth_header)
+            assert len(captured_chat_history) == 2  # Prior turn: 1 user msg, 1 assistant msg
+            assert captured_chat_history[0]["role"] == "user"
+            assert "Rahul Kumar" in captured_chat_history[0]["content"]
+            assert captured_chat_history[1]["role"] == "assistant"
+

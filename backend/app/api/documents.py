@@ -147,6 +147,8 @@ async def upload_document(
         file_size=total_bytes,
         file_path=str(target_path),
         file_hash=file_hash,
+        uploaded_by_id=current_user.id,
+        is_restricted=False,
         status="processing",
         page_count=0,
         chunk_count=0,
@@ -249,6 +251,8 @@ def list_documents(
             "chunk_count": d.chunk_count,
             "extraction_method": d.extraction_method,
             "error_message": d.error_message,
+            "uploaded_by_id": d.uploaded_by_id,
+            "is_restricted": d.is_restricted,
             "created_at": d.created_at.isoformat() if d.created_at else None
         }
         for d in docs
@@ -260,10 +264,17 @@ def get_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Retrieves metadata for a specific document."""
+    """Retrieves metadata for a specific document with permission check."""
     doc = db.query(Document).filter(Document.id == document_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
+
+    if doc.is_restricted and current_user.role != "admin" and doc.uploaded_by_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You do not have permission to access this restricted document."
+        )
+
     return {
         "id": doc.id,
         "filename": doc.filename,
@@ -275,6 +286,8 @@ def get_document(
         "chunk_count": doc.chunk_count,
         "extraction_method": doc.extraction_method,
         "error_message": doc.error_message,
+        "uploaded_by_id": doc.uploaded_by_id,
+        "is_restricted": doc.is_restricted,
         "created_at": doc.created_at.isoformat() if doc.created_at else None
     }
 
@@ -320,6 +333,12 @@ def get_document_file(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
 
+    if doc.is_restricted and current_user.role != "admin" and doc.uploaded_by_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You do not have permission to view or download this restricted document."
+        )
+
     if not doc.file_path or not os.path.isfile(doc.file_path):
         raise HTTPException(status_code=404, detail="Document file does not exist on disk.")
 
@@ -354,6 +373,12 @@ def get_document_chunks(
     doc = db.query(Document).filter(Document.id == document_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
+
+    if doc.is_restricted and current_user.role != "admin" and doc.uploaded_by_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You do not have permission to view chunks for this restricted document."
+        )
 
     chunks = db.query(DocumentChunk).filter(DocumentChunk.document_id == document_id).order_by(DocumentChunk.chunk_index).all()
     return {
@@ -430,6 +455,12 @@ def delete_document(
     doc = db.query(Document).filter(Document.id == document_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
+
+    if current_user.role != "admin" and doc.uploaded_by_id is not None and doc.uploaded_by_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You can only delete documents that you uploaded, or contact an Administrator."
+        )
 
     # 1. Purge vectors from ChromaDB
     try:
