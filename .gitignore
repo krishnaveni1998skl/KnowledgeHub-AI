@@ -1,0 +1,28 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local data & artifacts
+backend/data/
+*.db
+*.sqlite3
+
+# Build outputs
+knowledgehub-ai/dist/
+knowledgehub-ai/dist-ssr/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,21 @@
+# KnowledgeHub AI - Backend Dependencies
+# Phase 2: Core API & Database Foundation
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+python-dotenv>=1.0.1
+sqlalchemy>=2.0.36
+python-multipart>=0.0.12
+httpx>=0.27.0
+pytest>=8.0.0
+
+# Phase 3: Document Processing & Extraction
+pymupdf>=1.24.10
+python-docx>=1.1.2
+pytesseract>=0.3.13
+pillow>=10.4.0
+
+# Phase 4: Cohere RAG & Vector Storage
+cohere>=5.11.0
+chromadb>=0.5.15
